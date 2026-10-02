@@ -1,0 +1,165 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Codemagic — iOS build + upload to App Store Connect (TestFlight)
+# Reusable base for any 101 SAS Flutter app.
+#
+# Derived from the working 101 Fintech pipeline (desarrollofasemovil/101Fintech,
+# PRs #66, #67, #72). Copy it to the ROOT of the app repo as `codemagic.yaml`
+# and replace every value marked  ⟦CHANGE⟧ . Everything else is shared.
+#
+# iOS only. Android is published from GitHub Actions on Linux; duplicating it
+# here would burn macOS minutes on something that already works for free.
+#
+# Started BY HAND from Codemagic (there is no `triggering` block): every macOS
+# build costs minutes from a quota shared by all the team's apps, and a push
+# should not spend them on its own.
+#
+# What must exist OUTSIDE the repo (see IOS_APP_STORE_RELEASE_GUIDE.md §4):
+#   · Team integration "101Software App Store" (App Store Connect API key).
+#   · Apple Distribution certificate + App Store provisioning profile for the
+#     bundle ID, uploaded in Codemagic → Code signing identities.
+#   · (Optional) an environment-variable group with the app's secrets.
+# ─────────────────────────────────────────────────────────────────────────────
+
+workflows:
+  ios-testflight:
+    name: iOS · TestFlight
+    instance_type: mac_mini_m2
+    # Hard cap per build, in minutes. A stuck build (signing, hung upload) must
+    # not eat a whole hour of the shared quota. A healthy Flutter build takes
+    # ~15–25 min on M2. If a HEALTHY build starts brushing the cap, raise it —
+    # a timeout spends all 30 minutes and gives you nothing.
+    max_build_duration: 30
+
+    integrations:
+      # Exact name of the team integration. Shared by all apps — do not change.
+      app_store_connect: 101Software App Store
+
+    environment:
+      flutter: 3.44.0              # ⟦CHANGE⟧ same version as the app's Android CI / local
+      # `latest` keeps us on the newest Xcode. Since 2026-04-28 Apple only
+      # accepts builds made with Xcode 26 / iOS 26 SDK or later.
+      xcode: latest
+      # groups:                    # ⟦CHANGE⟧ uncomment if the app has secrets
+      #   - api_myapp
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: com.example.myapp     # ⟦CHANGE⟧
+      vars:
+        BUNDLE_ID: com.example.myapp             # ⟦CHANGE⟧ same as above
+        # NUMERIC Apple ID of the app in App Store Connect
+        # (App Information → General → "Apple ID"). Not a secret.
+        # With it, the "Build number" step asks TestFlight for the last build
+        # and never collides with a number already uploaded.
+        APP_STORE_APPLE_ID: 0000000000           # ⟦CHANGE⟧
+        # Floor for CFBundleVersion. A build that Apple REJECTS while
+        # processing it still burns its number, but TestFlight does not list
+        # it, so the lookup below cannot see it and would reuse it.
+        # Raise it by hand when that happens; never lower it.
+        BUILD_NUMBER_MINIMO: 1                   # ⟦CHANGE⟧ only after a burned build
+
+    scripts:
+      - name: Dependencies
+        script: flutter pub get
+
+      # ── OPTIONAL: compose env.json from a versioned template + secrets ──────
+      # Delete this step if the app has no --dart-define secrets.
+      # Pattern used by 101 Fintech: public values live in env.example.json
+      # (committed), secrets come from the Codemagic group, and the build
+      # FAILS here if any of them arrived empty — otherwise the app would
+      # compile and break at runtime with an error that hides the cause.
+      #
+      # - name: Compose env.json
+      #   script: |
+      #     jq --arg a "$SECRET_A" --arg b "$SECRET_B" \
+      #        '.SECRET_A=$a | .SECRET_B=$b' env.example.json > env.json
+      #     if ! jq -e 'to_entries | all(.value | (type == "string") and (length > 0))' env.json > /dev/null; then
+      #       echo "env.json has empty values. Keys without value (names only, never values):"
+      #       jq -r 'to_entries[] | select((.value|type)!="string" or (.value|length)==0) | "  - " + .key' env.json
+      #       echo "Check the variable group name in Codemagic and that the variables are INSIDE it."
+      #       exit 1
+      #     fi
+
+      # Switches the Xcode project to manual signing with the profile that
+      # `ios_signing` fetched, and writes /Users/builder/export_options.plist.
+      - name: Signing
+        script: xcode-project use-profiles
+
+      # CFBundleShortVersionString = pubspec version (same as Android).
+      # CFBundleVersion must be UNIQUE per upload of that version: if TestFlight
+      # already has one >= the pubspec build number, use the next one. This way
+      # re-running the same version never breaks the upload.
+      - name: Build number
+        script: |
+          VERSION=$(grep -E '^version:' pubspec.yaml | sed -E 's/^version:[[:space:]]*//')
+          BUILD_NAME="${VERSION%%+*}"
+          BUILD_NUMBER="${VERSION##*+}"
+
+          if [ -n "${APP_STORE_APPLE_ID:-}" ] && [ "$APP_STORE_APPLE_ID" != "0000000000" ]; then
+            LATEST=$(app-store-connect get-latest-testflight-build-number "$APP_STORE_APPLE_ID" \
+                       --pre-release-version "$BUILD_NAME" 2>/dev/null || echo 0)
+            if [ "${LATEST:-0}" -ge "$BUILD_NUMBER" ] 2>/dev/null; then
+              BUILD_NUMBER=$((LATEST + 1))
+            fi
+          else
+            echo "APP_STORE_APPLE_ID not set: using the pubspec build number as-is."
+          fi
+
+          if [ "$BUILD_NUMBER" -lt "${BUILD_NUMBER_MINIMO:-0}" ] 2>/dev/null; then
+            BUILD_NUMBER=$BUILD_NUMBER_MINIMO
+          fi
+
+          echo "BUILD_NAME=$BUILD_NAME" >> "$CM_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$CM_ENV"
+          echo "Version: $BUILD_NAME ($BUILD_NUMBER)"
+
+      # Guardrail: fail in 1 second instead of after 20 minutes + an Apple
+      # rejection e-mail. Checks the three mistakes we already paid for.
+      - name: Pre-flight checks
+        script: |
+          set -e
+          PLIST=ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :ITSAppUsesNonExemptEncryption" "$PLIST" >/dev/null \
+            || { echo "Missing ITSAppUsesNonExemptEncryption in Info.plist (guide §10.3)"; exit 1; }
+          if grep -q 'TARGETED_DEVICE_FAMILY = "1,2"' ios/Runner.xcodeproj/project.pbxproj; then
+            echo "App declares iPad support (TARGETED_DEVICE_FAMILY = \"1,2\") → error 90474 (guide §10.2)"; exit 1
+          fi
+          ICON=ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-1024x1024@1x.png
+          if [ "$(sips -g hasAlpha "$ICON" | awk '/hasAlpha/{print $2}')" = "yes" ]; then
+            echo "1024 icon has an alpha channel → ITMS-90717 (guide §10.1)"; exit 1
+          fi
+          echo "Pre-flight OK"
+
+      - name: Build IPA
+        script: |
+          flutter build ipa --release \
+            --build-name="$BUILD_NAME" \
+            --build-number="$BUILD_NUMBER" \
+            --obfuscate \
+            --split-debug-info="symbols/ios-${BUILD_NAME}+${BUILD_NUMBER}" \
+            --export-options-plist=/Users/builder/export_options.plist
+          # ⟦CHANGE⟧ add  --dart-define-from-file=env.json  if you kept that step
+
+      # Without the Dart symbols, obfuscated stack traces are unreadable forever
+      # and cannot be regenerated by rebuilding. dSYMs are what Crashlytics needs
+      # for the native side. Download and archive both next to the IPA.
+      - name: Package symbols
+        script: |
+          ditto -c -k --keepParent "symbols/ios-${BUILD_NAME}+${BUILD_NUMBER}" \
+            "dart-symbols-ios-${BUILD_NAME}+${BUILD_NUMBER}.zip"
+          if [ -d build/ios/archive/Runner.xcarchive/dSYMs ]; then
+            ditto -c -k --keepParent build/ios/archive/Runner.xcarchive/dSYMs \
+              "dsyms-ios-${BUILD_NAME}+${BUILD_NUMBER}.zip"
+          fi
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - dart-symbols-ios-*.zip
+      - dsyms-ios-*.zip
+      - /tmp/xcodebuild_logs/*.log
+
+    publishing:
+      app_store_connect:
+        auth: integration
+        # Available to INTERNAL testers with no Apple review. Sending to external
+        # testers (Beta App Review) is decided by hand in App Store Connect.
+        submit_to_testflight: false
